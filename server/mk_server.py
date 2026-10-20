@@ -360,6 +360,7 @@ class Job:
         self.cid = "chatcmpl-" + uuid.uuid4().hex  # the response id
         self.rid = rid or self.cid  # the client's X-Request-Id or the response id: in every log line and echoed
         self.tools = body.get("tools") or []
+        self.thinking = thinking  # the rendered prompt's mode: the sampling defaults pick their set by it
         self.parser = OutputParser(thinking, self.tools)
         self.dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.tail, self.shown = {"reasoning": "", "content": ""}, 0.0
@@ -504,10 +505,18 @@ class Server:
     def sampling(self, job):
         """sets the job's sequence's sampling from the request"""
         body = job.body
-        temp = float(body.get("temperature", 0.8) if body.get("temperature") is not None else 0.8)
-        top_p = float(body.get("top_p", 0.95) if body.get("top_p") is not None else 0.95)
-        top_k = int(body.get("top_k", 40) if body.get("top_k") is not None else 40)
-        min_p = float(body.get("min_p", 0.05) if body.get("min_p") is not None else 0.05)
+        # mode-aware server defaults: a non-thinking request falls
+        # back to the -instruct flags when set, else the shared ones; a request
+        # value always wins over both
+        if job.thinking:
+            d_temp, d_top_p = self.args.temperature, self.args.top_p
+        else:
+            d_temp = self.args.temperature_instruct if self.args.temperature_instruct is not None else self.args.temperature
+            d_top_p = self.args.top_p_instruct if self.args.top_p_instruct is not None else self.args.top_p
+        temp = float(body["temperature"]) if body.get("temperature") is not None else d_temp
+        top_p = float(body["top_p"]) if body.get("top_p") is not None else d_top_p
+        top_k = int(body["top_k"]) if body.get("top_k") is not None else self.args.top_k
+        min_p = float(body["min_p"]) if body.get("min_p") is not None else self.args.min_p
         if job.seed is None:  # drawn once: the sampler is keyed by (seed, position), so a resume continues the same draws
             seed = body.get("seed")
             job.seed = random.getrandbits(63) if seed is None or int(seed) < 0 else int(seed)
@@ -1043,6 +1052,20 @@ def main():
     ap.add_argument("--think-budget", type=int, default=0,
                     help="reasoning tokens per request before </think> is forced (0: unlimited); "
                          "a request's thinking_budget overrides it")
+    ap.add_argument("--temperature", type=float, default=0.8,
+                    help="server default temperature for requests that send none (<= 0: greedy)")
+    ap.add_argument("--top-p", type=float, default=0.95,
+                    help="server default top_p for requests that send none")
+    ap.add_argument("--top-k", type=int, default=40,
+                    help="server default top_k for requests that send none (engine samples from at most 32)")
+    ap.add_argument("--min-p", type=float, default=0.05,
+                    help="server default min_p for requests that send none (0: off)")
+    ap.add_argument("--temperature-instruct", type=float, default=None,
+                    help="server default temperature for NON-thinking requests that send none "
+                         "(unset: inherit --temperature)")
+    ap.add_argument("--top-p-instruct", type=float, default=None,
+                    help="server default top_p for NON-thinking requests that send none "
+                         "(unset: inherit --top-p)")
     args = ap.parse_args()
     if not 0 < args.prefill_share <= 1:
         ap.error("--prefill-share must be in (0, 1]")
