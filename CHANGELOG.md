@@ -23,6 +23,11 @@ greedy, `-d 4`. The newest build is the last row; what each one changed is under
 | za | v0.2.0 | w + y | 190 | 625 | 144 | 610 |
 | zc | v0.3.0 | shared paged KV pool, prefix cache, preemption | **190** | **622** | **143** | **610** |
 
+## v0.3.2: no crash with sampling at 5+ parallel requests
+
+- **Fixed an illegal memory access with sampling at 5 or more parallel requests**: with temperature above 0 and 17 to 24 draft rows in one cycle, the sampled draft head runs in two passes, and the second pass overwrote shared memory the first was still merging its top-k lists in. Garbage token ids then indexed the draft vocabulary out of bounds. A barrier between the passes fixes it; greedy decoding never took this path and is unchanged.
+- **`bench/tool_bench.py`**: long-context tool-call accuracy at 8K to 190K tokens, to compare `--kv f16` and `--kv q8` case by case (`--compare`).
+
 ## v0.3.1: running requests keep their speed, request ids, relocatable builds
 
 Server and build only; the kernel is build zc unchanged.

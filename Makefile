@@ -11,7 +11,7 @@ LLAMA_BIN ?= $(LLAMA)/build/bin
 GGML_LIBS = $(patsubst lib%.so,-l%,$(notdir $(wildcard $(LLAMA_BIN)/libggml*.so)))
 LDLLAMA = -L$(LLAMA_BIN) -Xlinker --no-as-needed -lllama $(GGML_LIBS) -Xlinker -rpath -Xlinker '$$ORIGIN'
 LLAMA_LIBS = .llama-libs
-VERSION ?= v0.3.1
+VERSION ?= v0.3.2
 DIST = geezuz-$(VERSION)-$(ARCH)
 
 all: geezuz libgeezuz.so geezuz_tp2 libgeezuz_tp2.so tools/vocab_freq tools/llama_ref

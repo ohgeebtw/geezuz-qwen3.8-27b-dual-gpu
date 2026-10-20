@@ -28,11 +28,11 @@ Built on L-Forster's single-GPU megakernel from [open-jet](https://github.com/L-
 
 ### Prebuilt (RTX 30)
 
-[Releases](https://github.com/ohgeebtw/geezuz-qwen3.8-27b-dual-gpu/releases) has `geezuz-v0.3.1-sm_86.tar.gz` for RTX 30 cards (sm_86): the one-GPU and two-GPU CLI and server libraries, libllama for the tokenizer, the server and the draft vocabulary. It needs Linux x86-64 with glibc 2.35+ (Ubuntu 22.04 or newer), NVIDIA driver 575.57+, Python 3 with `jinja2` for the server, and P2P for two GPUs (see [Two GPUs](#two-gpus)).
+[Releases](https://github.com/ohgeebtw/geezuz-qwen3.8-27b-dual-gpu/releases) has `geezuz-v0.3.2-sm_86.tar.gz` for RTX 30 cards (sm_86): the one-GPU and two-GPU CLI and server libraries, libllama for the tokenizer, the server and the draft vocabulary. It needs Linux x86-64 with glibc 2.35+ (Ubuntu 22.04 or newer), NVIDIA driver 575.57+, Python 3 with `jinja2` for the server, and P2P for two GPUs (see [Two GPUs](#two-gpus)).
 
 ```sh
-sha256sum -c geezuz-v0.3.1-sm_86.tar.gz.sha256
-tar xzf geezuz-v0.3.1-sm_86.tar.gz && cd geezuz-v0.3.1-sm_86
+sha256sum -c geezuz-v0.3.2-sm_86.tar.gz.sha256
+tar xzf geezuz-v0.3.2-sm_86.tar.gz && cd geezuz-v0.3.2-sm_86
 MK_DEVICES=0,1 ./geezuz_tp2 -m Qwen3.8-27B-Q4_K_M.gguf -p "Write quicksort in C" -n 512 -d 4 --draft-vocab draft_vocab_32k.bin
 python3 server/mk_server.py -m Qwen3.8-27B-Q4_K_M.gguf --lib ./libgeezuz_tp2.so -c 16384 --slots 8
 ```
@@ -394,6 +394,7 @@ llama-quantize Qwen3.8-27B-BF16-00001-of-00002.gguf Qwen3.8-27B-Q4_K_M.gguf Q4_K
 | `tools/llama_ref.cpp` / `logit_stats.h` | llama.cpp reference distributions and the comparison with them |
 | `bench/tp2_bench.py`, `bench/batch_bench.py` | two-GPU benchmark vs llama-server; parallel-request sweep (Geezuz, llama.cpp, vLLM) |
 | `bench/quality_bench.py`, `bench/gsm8k_test.jsonl` | GSM8K accuracy through each engine's server (test set from openai/grade-school-math) |
+| `bench/tool_bench.py` | long-context tool-call accuracy, fp16 vs q8 KV |
 | `bench/code_bench.py`, `bench/think_bench.py`, `bench/bench.py` | one-GPU benchmarks |
 | `bench/*_bench.cu` | GEMV / GEMM microbenchmarks |
 | `docker/build.Dockerfile`, `scripts/box-*.sh` | containerized build on a remote GPU host |
@@ -402,4 +403,4 @@ llama-quantize Qwen3.8-27B-BF16-00001-of-00002.gguf Qwen3.8-27B-Q4_K_M.gguf Q4_K
 
 The megakernel is the work of **L-Forster** in [open-jet](https://github.com/L-Forster/open-jet): the decode megakernel, the prefill kernels, the loader, the server and CLI, the one-GPU benchmarks (`bench/code_bench.py`, `bench/think_bench.py`, `bench/bench.py`, `bench/{ffn,gemv,mmq,resid}_bench.cu`), the quality tooling (`tools/llama_ref`, `logit_stats.h`, `--kld`) and the draft vocabulary. This repository is a modified version of `megakernel/` at commit `2993f47`, imported with its git history, licensed under the GNU Affero General Public License v3.0 and distributed under the same license (see `LICENSE`).
 
-Modifications, October 2026: sources moved to the repository root; per-tensor Q4_K / Q5_K / Q6_K / Q8_0 weights in decode and prefill; tensor parallelism over two GPUs via PCIe P2P (decode and prefill) with the two-GPU tuning; batched decode of up to 8 slots (tensor-core GEMVs, int8 exchange, server scheduler); shared paged KV pool with prefix cache and preemption (`kv_cache.h`, `tests/`); `bench/tp2_bench.py`, `bench/batch_bench.py`, `bench/quality_bench.py`, `bench/kq_mma_bench.cu`, `bench/q6_dp4a_bench.cu`; the benchmarks and quality checks above.
+Modifications, October 2026: sources moved to the repository root; per-tensor Q4_K / Q5_K / Q6_K / Q8_0 weights in decode and prefill; tensor parallelism over two GPUs via PCIe P2P (decode and prefill) with the two-GPU tuning; batched decode of up to 8 slots (tensor-core GEMVs, int8 exchange, server scheduler); shared paged KV pool with prefix cache and preemption (`kv_cache.h`, `tests/`); `bench/tp2_bench.py`, `bench/batch_bench.py`, `bench/quality_bench.py`, `bench/tool_bench.py`, `bench/kq_mma_bench.cu`, `bench/q6_dp4a_bench.cu`; the benchmarks and quality checks above.

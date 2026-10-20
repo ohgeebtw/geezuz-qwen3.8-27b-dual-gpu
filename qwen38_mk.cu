@@ -2445,6 +2445,7 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, int kx, uint8_t * /*sm*
     if constexpr (TOPK && TL > MR) {
         // a warp's top-k lists of TL rows do not fit in registers: two passes over the head
         lm_block<MR, true, FULL>(t0, 0, draft);
+        __syncthreads(); // the second pass's activation fill overwrites the warp lists the first pass is still merging
         lm_block<TL - MR, true, FULL>(t0 + MR, MR, draft);
     } else {
         lm_block<TL, TOPK, FULL>(t0, 0, draft);
