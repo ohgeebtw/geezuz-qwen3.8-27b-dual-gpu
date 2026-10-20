@@ -285,12 +285,15 @@ Prompts go through ordinary kernel launches (`prefill.cuh`) in chunks of up to 2
 | `--prefill-chunk` | 512 | prompt tokens fed at a time while other requests decode (they stall one chunk at most) |
 | `--prefill-share` | 0.25 | share of the time prompts are prefilled while other requests decode: those keep the rest of their speed, a prompt takes 1/share times as long |
 | `--think-budget` | 0 | reasoning tokens per request before `</think>` is forced (0: unlimited; a request's `thinking_budget` overrides it) |
+| `--temperature`, `--top-p` | 1.0, 0.95 | sampling for thinking requests that send none (model-card values) |
+| `--temperature-instruct`, `--top-p-instruct` | 0.7, 0.8 | the same for non-thinking requests |
+| `--top-k`, `--min-p` | 20, 0 | sampling for requests that send none, both modes |
 
 - Prompts use the chat template stored in the GGUF: `chat_template_kwargs` `enable_thinking` / `preserve_thinking` / `reasoning_effort`, OpenAI `tools`. Reasoning streams as `reasoning_content`; tool calls come back as `tool_calls`.
 - Follow-up requests of a conversation, and requests sharing a system prompt, only prefill what is not in the prefix cache. Requests that arrive together with the same uncached system prompt prefill it once: the others wait until it is in, then start from its snapshot.
 - With nothing decoding, prompts are prefilled whole. While others decode, prompts go in `--prefill-chunk` chunks, shortest remaining prompt first, for `--prefill-share` of the time.
 - Request ids: a client's `X-Request-Id` header (letters, digits, `._:-`, up to 128) or else the response id (`chatcmpl-...`) tags every log line of the request (`slot N [id]: ...`: admission, cache hit, preemption, thinking budget, finish, errors), is echoed in the response's `X-Request-Id` header and shows as `id` per slot in `/status`.
-- Sampling: temperature, top_p, top_k (<= 32), min_p, seed. Presence / repetition penalties are ignored (with a warning).
+- Sampling: temperature, top_p, top_k (<= 32), min_p, seed; values a request leaves out come from the server's defaults for its mode (thinking or not). Presence / repetition penalties are ignored (with a warning).
 - `GET /status` reports each slot (with its request `id` and preemption count), `kv_pool` (free, total, cached, evictable and `used_blocks` held by running requests, tokens per block, `updated`: read after every decode cycle) and `preempted`; `/props` reports `total_slots`.
 
 open-jet uses this server in place of `llama-server` (`openjet setup` builds the one-GPU engine).

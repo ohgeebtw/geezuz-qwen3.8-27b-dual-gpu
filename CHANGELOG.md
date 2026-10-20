@@ -23,6 +23,10 @@ greedy, `-d 4`. The newest build is the last row; what each one changed is under
 | za | v0.2.0 | w + y | 190 | 625 | 144 | 610 |
 | zc | v0.3.0 | shared paged KV pool, prefix cache, preemption | **190** | **622** | **143** | **610** |
 
+## Unreleased
+
+- **Server sampling defaults follow the model card** (contributed by chimpera): a request without sampling values gets temperature 1.0, top_p 0.95 when thinking and 0.7, 0.8 when not, top_k 20 and min_p 0 in both (was 0.8, 0.95, 40, 0.05 for every request); `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--temperature-instruct`, `--top-p-instruct` change them.
+
 ## v0.3.2: no crash with sampling at 5+ parallel requests
 
 - **Fixed an illegal memory access with sampling at 5 or more parallel requests**: with temperature above 0 and 17 to 24 draft rows in one cycle, the sampled draft head runs in two passes, and the second pass overwrote shared memory the first was still merging its top-k lists in. Garbage token ids then indexed the draft vocabulary out of bounds. A barrier between the passes fixes it; greedy decoding never took this path and is unchanged.
