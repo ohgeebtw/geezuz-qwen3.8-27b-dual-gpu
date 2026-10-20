@@ -505,14 +505,10 @@ class Server:
     def sampling(self, job):
         """sets the job's sequence's sampling from the request"""
         body = job.body
-        # mode-aware server defaults: a non-thinking request falls
-        # back to the -instruct flags when set, else the shared ones; a request
-        # value always wins over both
-        if job.thinking:
-            d_temp, d_top_p = self.args.temperature, self.args.top_p
-        else:
-            d_temp = self.args.temperature_instruct if self.args.temperature_instruct is not None else self.args.temperature
-            d_top_p = self.args.top_p_instruct if self.args.top_p_instruct is not None else self.args.top_p
+        # mode-aware server defaults: a non-thinking request uses the -instruct
+        # flags; a request value always wins over both sets
+        d_temp, d_top_p = ((self.args.temperature, self.args.top_p) if job.thinking
+                           else (self.args.temperature_instruct, self.args.top_p_instruct))
         temp = float(body["temperature"]) if body.get("temperature") is not None else d_temp
         top_p = float(body["top_p"]) if body.get("top_p") is not None else d_top_p
         top_k = int(body["top_k"]) if body.get("top_k") is not None else self.args.top_k
@@ -1052,20 +1048,20 @@ def main():
     ap.add_argument("--think-budget", type=int, default=0,
                     help="reasoning tokens per request before </think> is forced (0: unlimited); "
                          "a request's thinking_budget overrides it")
-    ap.add_argument("--temperature", type=float, default=0.8,
-                    help="server default temperature for requests that send none (<= 0: greedy)")
+    ap.add_argument("--temperature", type=float, default=1.0,
+                    help="default temperature for thinking requests that send none "
+                         "(Qwen3.8-27B model-card rec; <= 0: greedy)")
     ap.add_argument("--top-p", type=float, default=0.95,
-                    help="server default top_p for requests that send none")
-    ap.add_argument("--top-k", type=int, default=40,
-                    help="server default top_k for requests that send none (engine samples from at most 32)")
-    ap.add_argument("--min-p", type=float, default=0.05,
-                    help="server default min_p for requests that send none (0: off)")
-    ap.add_argument("--temperature-instruct", type=float, default=None,
-                    help="server default temperature for NON-thinking requests that send none "
-                         "(unset: inherit --temperature)")
-    ap.add_argument("--top-p-instruct", type=float, default=None,
-                    help="server default top_p for NON-thinking requests that send none "
-                         "(unset: inherit --top-p)")
+                    help="default top_p for thinking requests that send none (model-card rec)")
+    ap.add_argument("--top-k", type=int, default=20,
+                    help="default top_k for requests that send none (model-card rec; the engine samples "
+                         "from at most 32)")
+    ap.add_argument("--min-p", type=float, default=0.0,
+                    help="default min_p for requests that send none (model-card rec: off)")
+    ap.add_argument("--temperature-instruct", type=float, default=0.7,
+                    help="default temperature for non-thinking requests that send none (model-card rec)")
+    ap.add_argument("--top-p-instruct", type=float, default=0.8,
+                    help="default top_p for non-thinking requests that send none (model-card rec)")
     args = ap.parse_args()
     if not 0 < args.prefill_share <= 1:
         ap.error("--prefill-share must be in (0, 1]")
