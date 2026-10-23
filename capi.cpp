@@ -152,6 +152,10 @@ int mk_append(void * hp, int id, const int * toks, int n, const int * snap, int 
 
 int mk_n_seq(void * hp) { return static_cast<Handle *>(hp)->eng->n_seq(); }
 
+// progress of the latest mk_prefill / mk_append: (calls so far, mod 2^31) << 32 | sequence position processed up to;
+// callable from another thread during that call (selects no sequence)
+long long mk_prefill_progress(void * hp) { return static_cast<Handle *>(hp)->eng->prefill_progress(); }
+
 // one decode cycle for n distinct sequences; sequence ids[i] writes counts[i] tokens to out[i * cap ..]; 0, -1 or
 // MK_POOL_FULL (none stepped)
 int mk_step_batch(void * hp, const int * ids, int n, int * out, int cap, int * counts) {

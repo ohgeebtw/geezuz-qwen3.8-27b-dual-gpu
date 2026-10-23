@@ -294,7 +294,7 @@ Prompts go through ordinary kernel launches (`prefill.cuh`) in chunks of up to 2
 - With nothing decoding, prompts are prefilled whole. While others decode, prompts go in `--prefill-chunk` chunks, shortest remaining prompt first, for `--prefill-share` of the time.
 - Request ids: a client's `X-Request-Id` header (letters, digits, `._:-`, up to 128) or else the response id (`chatcmpl-...`) tags every log line of the request (`slot N [id]: ...`: admission, cache hit, preemption, thinking budget, finish, errors), is echoed in the response's `X-Request-Id` header and shows as `id` per slot in `/status`.
 - Sampling: temperature, top_p, top_k (<= 32), min_p, seed; values a request leaves out come from the server's defaults for its mode (thinking or not). Presence / repetition penalties are ignored (with a warning).
-- `GET /status` reports each slot (with its request `id` and preemption count), `kv_pool` (free, total, cached, evictable and `used_blocks` held by running requests, tokens per block, `updated`: read after every decode cycle) and `preempted`; `/props` reports `total_slots`.
+- `GET /status` reports each slot (with its request `id` and preemption count; while it reads its prompt also `prefilled`, the position reached, live per 2,048-token chunk, and `prefill_tok_s`), `kv_pool` (free, total, cached, evictable and `used_blocks` held by running requests, tokens per block, `updated`: read after every decode cycle) and `preempted`; `/props` reports `total_slots`.
 
 open-jet uses this server in place of `llama-server` (`openjet setup` builds the one-GPU engine).
 

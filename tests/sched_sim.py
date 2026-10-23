@@ -1,5 +1,5 @@
 """Fake-engine simulation of mk_server.Server's scheduler (admission, preemption, hold, think stop)."""
-import random, sys, types, queue, collections, importlib.util, time, os
+import random, sys, types, queue, collections, importlib.util, threading, time, os
 
 # stub jinja2
 j = types.ModuleType("jinja2"); j.exceptions = types.SimpleNamespace(TemplateError=Exception)
@@ -19,6 +19,7 @@ class FakeEng:
         self.seqs = {}  # id -> dict(toks, blocks, dn)
         self.cache = collections.OrderedDict()  # tuple(prefix) -> blocks (LRU order)
         self.nid = 0
+        self.calls, self.pos = 0, 0
         self.closed_keep = 0
 
     def used(self):
@@ -38,6 +39,9 @@ class FakeEng:
 
     def kv_ahead(self):
         return KV_AHEAD
+
+    def prefill_progress(self):
+        return self.calls, self.pos
 
     def seq_open(self, toks):
         if len(self.seqs) >= SLOTS:
@@ -77,6 +81,7 @@ class FakeEng:
 
     def append(self, i, toks, snaps=()):
         s = self.seqs[i]
+        self.calls, self.pos = self.calls + 1, s["dn"]
         if not toks:
             raise RuntimeError("empty prompt")
         L = len(s["toks"]) + len(toks)
@@ -84,7 +89,7 @@ class FakeEng:
             raise RuntimeError("prompt exceeds context")
         self._grow(s, L + MAXT)
         s["toks"] += toks
-        s["dn"] = L
+        s["dn"] = self.pos = L
         t = self._next(s)
         s["toks"].append(t)
         return t
@@ -145,12 +150,14 @@ def run(seed, nblocks, slots, njobs, ctx=2048):
     rng = random.Random(seed)
     srv = object.__new__(mk.Server)
     srv.args = types.SimpleNamespace(slots=slots, prefill_chunk=64, prefill_share=rng.choice([0.25, 1.0]), ctx=ctx,
-                                     think_budget=0)
+                                     think_budget=0, temperature=1.0, top_p=0.95, temperature_instruct=0.7,
+                                     top_p_instruct=0.8, top_k=20, min_p=0.0)
     srv.eng = FakeEng(nblocks, ctx, rng)
     srv.warned = set(); srv.queue = queue.Queue(); srv.waiting = collections.deque()
     srv.pool = srv.pool_stats(); srv.prefill_owed = 0.0; srv.kv_ahead = KV_AHEAD; srv.active = {}
     srv.admissions = 0; srv.preempted = 0; srv.think_stop_n = len(THINK_TOKS)
     srv.slot_status = [{"slot": s, "busy": False, "phase": "idle", "action": None, "updated": 0} for s in range(slots)]
+    srv.pf, srv.pf_on, srv.pf_seen = None, threading.Event(), None
     srv.last = None
     jobs = []
     system = [rng.randrange(1, 800) for _ in range(rng.randint(20, 200))]  # a prefix some prompts share
@@ -180,6 +187,10 @@ def run(seed, nblocks, slots, njobs, ctx=2048):
         for s, j in srv.active.items():
             assert j.slot == s and j.seq in srv.eng.seqs, "active job without sequence"
         assert len(srv.eng.seqs) == len(srv.active), ("leaked seqs", len(srv.eng.seqs), len(srv.active))
+        for st in srv.status()["slots"]:
+            if st["busy"] and st["phase"] in ("prefill", "resume"):
+                j = srv.active[st["slot"]]
+                assert st["prefill_from"] <= st["prefilled"] <= len(j.feed), ("prefill progress", st, len(j.feed))
     res = collections.Counter()
     for j in jobs:
         ev = list(j.events.queue)

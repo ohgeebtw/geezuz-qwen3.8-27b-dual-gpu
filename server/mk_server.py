@@ -26,7 +26,9 @@ alone that cannot grow ends with finish_reason "length".
 GET /status: what the engine is doing now (phase, live token count, tail of the reasoning / text / tool call being
 generated, per slot under `slots` with the request `id`), the KV pool (`kv_pool`, read after every decode cycle;
 `used_blocks` = held by running requests, `updated` = read time), preemptions (`preempted`, per slot `preempts`)
-and the stats of the last finished request.
+and the stats of the last finished request.  A slot reading its prompt (phase prefill / resume) shows `prefilled`
+(sequence position reached, live per 2,048-token chunk) and `prefill_tok_s` (prompt tokens processed since
+admission, cached ones excluded, per second up to when that position was reached).
 """
 import argparse
 import codecs
@@ -89,6 +91,7 @@ class Engine:
             "mk_step_batch": (ctypes.c_int, [vp, ip, ctypes.c_int, ip, ctypes.c_int, ip]),
             "mk_truncate": (ctypes.c_int, [vp, ctypes.c_int, ctypes.c_int]),
             "mk_sequence": (ctypes.c_int, [vp, ctypes.c_int, ip, ctypes.c_int]),
+            "mk_prefill_progress": (ctypes.c_longlong, [vp]),
         }
         for name, (res, args) in sig.items():
             f = getattr(L, name)
@@ -170,6 +173,12 @@ class Engine:
     def append(self, i, toks, snaps=()):
         """prefill() without the state before the last token (forced tokens, intermediate prompt chunks)"""
         return self._feed(self.L.mk_append, "append", i, toks, snaps)
+
+    def prefill_progress(self):
+        """(prefill() / append() calls so far, mod 2^31; sequence position the latest one has processed up to), live
+        while it runs: the one engine call a handler may make while the scheduler drives the engine (lock-free)"""
+        v = self.L.mk_prefill_progress(self.h)
+        return v >> 32, v & 0xFFFFFFFF
 
     def step_batch(self, ids):
         """one cycle of the given sequences; returns each one's tokens"""
@@ -410,7 +419,10 @@ class Server:
         self.warned = set()
         self.queue = queue.Queue()
         self.waiting = collections.deque()  # jobs not admitted yet for lack of a slot or KV blocks, in arrival order
-        self.pool = self.pool_stats()  # refreshed by the scheduler thread; the engine is not read from handlers
+        self.pool = self.pool_stats()  # refreshed by the scheduler thread; handlers only read eng.prefill_progress()
+        self.pf = None  # (slot, engine call count before it) while prefill() feeds that slot's prompt
+        self.pf_on = threading.Event()  # set while self.pf is
+        self.pf_seen = None  # (slot, engine call count, position, time the position was first seen)
         self.prefill_owed = 0.0  # decode seconds owed to running requests before the next prompt chunk
         self.kv_ahead = self.eng.kv_ahead()
         self.im_start = self.eng.tokenize("<|im_start|>")
@@ -423,6 +435,7 @@ class Server:
                             for s in range(args.slots)]
         self.last = None
         threading.Thread(target=self.run, name="scheduler", daemon=True).start()
+        threading.Thread(target=self.watch_prefill, name="prefill-watch", daemon=True).start()
         log(f"ready in {time.time() - t0:.1f} s: {self.model_id}, ctx {args.ctx}, {args.draft} drafts, "
             f"{args.slots} slot(s)")
 
@@ -538,11 +551,37 @@ class Server:
 
     def status(self):
         """the most recently updated busy slot at the top level (one-slot layout), every slot under `slots`"""
-        slots = list(self.slot_status)
+        slots = [self.prefill_status(st) for st in self.slot_status]
         busy = [st for st in slots if st["busy"]]
         top = max(busy or slots, key=lambda st: st["updated"])
         return {**top, "busy": bool(busy), "last": self.last, "queued": self.queue.qsize() + len(self.waiting),
                 "kv_pool": self.pool, "preempted": self.preempted, "slots": slots}
+
+    def prefill_status(self, st):
+        """slot snapshot st with its live prompt progress while it reads its prompt"""
+        if not st["busy"] or st["phase"] not in ("prefill", "resume") or st.get("prefill_from") is None:
+            return st
+        pos, at = st.get("prefilled") or st["prefill_from"], st.get("prefilled_t") or st["prefill_t"]
+        pf, seen = self.pf, self.pf_seen
+        if pf and seen and pf[0] == seen[0] == st["slot"] and seen[1] != pf[1] and seen[2] > pos:
+            pos, at = seen[2], seen[3]
+        elapsed = at - st["prefill_t"]
+        return {**st, "prefilled": pos,
+                "prefill_tok_s": (pos - st["prefill_from"]) / elapsed if elapsed > 0 else 0.0}
+
+    def watch_prefill(self):
+        """while prefill() runs, notes when the engine's position moves (per 2,048-token chunk), so the prompt rate
+        is tokens over the time they took, not over the time since (which saws between chunks)"""
+        while True:
+            self.pf_on.wait()
+            pf = self.pf
+            if pf:
+                calls, at = self.eng.prefill_progress()
+                seen = self.pf_seen
+                # a count still at pf[1] is the previous call's value: the engine has not entered this one yet
+                if calls != pf[1] and (not seen or seen[:3] != (pf[0], calls, at)):
+                    self.pf_seen = (pf[0], calls, at, time.time())
+            time.sleep(0.05)
 
     @staticmethod
     def rate(n_gen, elapsed):
@@ -631,6 +670,7 @@ class Server:
             job.seq, job.fed = self.eng.seq_open(job.feed)
             if first:
                 job.reused = job.fed
+            self.track(s, prefilled=job.fed, prefilled_t=None, prefill_from=job.fed, prefill_t=time.time())
             self.sampling(job)
             log(f"slot {s} [{job.rid}]: {'prompt' if first else 'resume'} {len(job.feed)} tok, {job.fed} cached")
         except Exception as e:
@@ -706,6 +746,8 @@ class Server:
         """feeds the job's feed, at most chunk tokens of it while other jobs are decoding (they stall one chunk at most)"""
         if self.active.get(job.slot) is not job:  # preempted earlier in this loop
             return
+        self.pf = (job.slot, self.eng.prefill_progress()[0])
+        self.pf_on.set()
         try:
             rest = job.feed[job.fed:]
             if chunk is not None and len(rest) > chunk:
@@ -714,12 +756,13 @@ class Server:
                     return
                 job.fed += chunk
                 self.eng.truncate(job.seq, job.fed)
-                self.track(job.slot, prefilled=job.fed)
+                self.track(job.slot, prefilled=job.fed, prefilled_t=time.time())
                 return
             tok = self.grow(job, lambda: self.eng.prefill(job.seq, rest, job.snaps))
             if tok is None:
                 return
             job.fed = len(job.feed)
+            self.track(job.slot, prefilled=job.fed, prefilled_t=time.time())
             if job.decoding and self.stop_due(job):
                 # preempted when its think stop was due: an unpreempted run forces the stop right after the token
                 # the feed ends with, so the resume's own token is dropped and the next cycle forces the stop
@@ -731,6 +774,9 @@ class Server:
         except Exception as e:
             self.fail(job, e)
             return
+        finally:
+            self.pf = None
+            self.pf_on.clear()
         if not job.decoding:
             job.decoding = True
             job.t1 = time.time()

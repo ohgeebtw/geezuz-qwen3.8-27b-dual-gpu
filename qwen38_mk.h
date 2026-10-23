@@ -84,6 +84,10 @@ class MKEngine {
     std::vector<float> last_hidden();
 
     int position() const;
+    // Progress of the latest prefill(): (number of prefill() calls so far, mod 2^31) << 32 | the sequence position it
+    // has processed up to, advancing per 2,048-token chunk of the batched kernels.  Lock-free: safe to call from
+    // another thread while that prefill() runs.
+    long long prefill_progress() const;
     // Teacher-forced greedy predictions: pred[i] = argmax of the next-token distribution after
     // tokens[0..i] (resets the sequence).
     std::vector<int> score(const std::vector<int> & tokens);

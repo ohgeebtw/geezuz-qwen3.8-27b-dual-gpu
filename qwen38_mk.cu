@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <map>
 #include <cmath>
@@ -3053,6 +3054,11 @@ struct MKEngine::Impl : KvDev {
     std::unique_ptr<Impl> sub;
     std::shared_ptr<HostBarrier> hbar;
     unsigned gen = 0; // launch generation, folded into the cross-card flag tags
+    // rank 0: prefill() calls so far << 32 | sequence position the latest one has processed up to (read by other
+    // threads while it runs)
+    unsigned pf_calls = 0;
+    std::atomic<long long> pf_pos{0};
+    void pf_mark(int n) { pf_pos.store((long long) pf_calls << 32 | (unsigned) n, std::memory_order_relaxed); }
     void use() const { CK(cudaSetDevice(dev)); }
     gguf::File file;
     ModelW hw{};
@@ -4401,7 +4407,9 @@ struct MKEngine::Impl : KvDev {
         else CK(cudaMemcpy(hp.h, sb().h_hist + (size_t) ((n0 - 1) % H_RING) * D, D * sizeof(float), cudaMemcpyDeviceToDevice));
         for (int c0 = 0; c0 < N; c0 += cap) {
             const int T = std::min(cap, N - c0), n = n0 + c0;
+            // a copy from pageable memory first waits for the previous chunk's kernels: up to n is done
             CK(cudaMemcpy(hp.tok, toks.data() + c0, T * sizeof(int), cudaMemcpyHostToDevice));
+            if (rank == 0) pf_mark(n);
             pf_time("embed", [&] { pk_embed<<<T, 256>>>(T); });
             int dl = 0;
             for (int L = 0; L < NL; L++) {
@@ -4575,6 +4583,7 @@ void MKEngine::pool_stats(int & free_blocks, int & total_blocks, int & block_tok
 int MKEngine::kv_ahead() { return KV_AHEAD; }
 
 int MKEngine::position() const { return p_->cur < 0 ? 0 : p_->S().hctl.n; }
+long long MKEngine::prefill_progress() const { return p_->pf_pos.load(std::memory_order_relaxed); }
 
 int MKEngine::prefill(const std::vector<int> & tokens, bool snapshot_end, const std::vector<int> & snap_pos) {
     if (tokens.empty()) throw std::runtime_error("empty prompt");
@@ -4594,6 +4603,8 @@ int MKEngine::prefill(const std::vector<int> & tokens, bool snapshot_end, const 
     // recurrent state, followed by the new tokens.  Their KV / MTP rows are simply rewritten.
     const int n0 = c.dn_c;
     const std::vector<int> feed(seq.begin() + n0, seq.end());
+    p_->pf_calls = (p_->pf_calls + 1) & 0x7fffffff;
+    p_->pf_mark(n0);
     c.mtp_valid = std::min(c.mtp_valid, n0);
     size_t i = 0;
     bool snapped = false;
@@ -4617,6 +4628,7 @@ int MKEngine::prefill(const std::vector<int> & tokens, bool snapshot_end, const 
             p_->snap_take(q);
         }
         p_->pf_run(std::vector<int>(seq.begin() + pos, seq.end() - 1), pos, nullptr);
+        p_->pf_mark(len - 1);
         i = feed.size() - 1;
         c.dn_c = len - 1;
         c.mtp_valid = c.dn_c;
