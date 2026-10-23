@@ -282,7 +282,7 @@ Prompts go through ordinary kernel launches (`prefill.cuh`) in chunks of up to 2
 | `--kv` | auto | KV cache: `f16`, `q8`, or `auto` (q8_0 only when the fp16 pool holds less than one `-c` request) |
 | `--kv-mem` | 0 | KV pool MB per card (0: the free memory after the slots and a reserve) |
 | `--slots` | 1 | requests decoded at once; more requests queue |
-| `--prefill-chunk` | 512 | prompt tokens fed at a time while other requests decode (they stall one chunk at most) |
+| `--prefill-chunk` | 2048 | prompt tokens fed at a time while other requests decode (they stall one chunk at most; smaller chunks re-read the cached context more often, which slows deep prompts) |
 | `--prefill-share` | 0.25 | share of the time prompts are prefilled while other requests decode: those keep the rest of their speed, a prompt takes 1/share times as long |
 | `--think-budget` | 0 | reasoning tokens per request before `</think>` is forced (0: unlimited; a request's `thinking_budget` overrides it) |
 | `--temperature`, `--top-p` | 1.0, 0.95 | sampling for thinking requests that send none (model-card values) |
@@ -291,10 +291,12 @@ Prompts go through ordinary kernel launches (`prefill.cuh`) in chunks of up to 2
 
 - Prompts use the chat template stored in the GGUF: `chat_template_kwargs` `enable_thinking` / `preserve_thinking` / `reasoning_effort`, OpenAI `tools`. Reasoning streams as `reasoning_content`; tool calls come back as `tool_calls`.
 - Follow-up requests of a conversation, and requests sharing a system prompt, only prefill what is not in the prefix cache. Requests that arrive together with the same uncached system prompt prefill it once: the others wait until it is in, then start from its snapshot.
-- With nothing decoding, prompts are prefilled whole. While others decode, prompts go in `--prefill-chunk` chunks, shortest remaining prompt first, for `--prefill-share` of the time.
+- With nothing decoding, prompts are prefilled whole. While others decode, prompts go in `--prefill-chunk` chunks, rounds alternating between shortest remaining prompt first and longest waiting first (a long prompt keeps half the prefill time while short turns keep arriving), for `--prefill-share` of the time.
+- Generated turns are replayed: a client sends a turn back as text and the template renders it again, which differs from the generated tokens where the parser dropped whitespace or normalized markup (a tool call opened inside thinking gets a `</think>`). The next prompt that renders a finished turn with the same text gets the generated tokens back, so the conversation keeps its prefix cache; the log line `turn of [id] rendered as N tok, generated as M tok, first difference at token K: ...` names each such turn. A turn whose text the client changed keeps its rendering.
+- A running request's deepest prompt snapshot is evicted only when nothing else is left, so a long generation keeps the fallback its next request resumes from.
 - Request ids: a client's `X-Request-Id` header (letters, digits, `._:-`, up to 128) or else the response id (`chatcmpl-...`) tags every log line of the request (`slot N [id]: ...`: admission, cache hit, preemption, thinking budget, finish, errors), is echoed in the response's `X-Request-Id` header and shows as `id` per slot in `/status`.
 - Sampling: temperature, top_p, top_k (<= 32), min_p, seed; values a request leaves out come from the server's defaults for its mode (thinking or not). Presence / repetition penalties are ignored (with a warning).
-- `GET /status` reports each slot (with its request `id` and preemption count; while it reads its prompt also `prefilled`, the position reached, live per 2,048-token chunk, and `prefill_tok_s`), `kv_pool` (free, total, cached, evictable and `used_blocks` held by running requests, tokens per block, `updated`: read after every decode cycle) and `preempted`; `/props` reports `total_slots`.
+- `GET /status` reports each slot (with its request `id` and preemption count; while it reads its prompt also `prefilled`, the position reached, live per 2,048-token chunk, and `prefill_tok_s`), `kv_pool` (free, total, cached, evictable and `used_blocks` held by running requests, tokens per block, `updated`: read after every decode cycle) `preempted` and `draft` (MTP draft counters since load: `cycles`, `drafted`, `accepted`, `accept_rate`); each request's finish log line adds its tokens per decode cycle; `/props` reports `total_slots`.
 
 open-jet uses this server in place of `llama-server` (`openjet setup` builds the one-GPU engine).
 

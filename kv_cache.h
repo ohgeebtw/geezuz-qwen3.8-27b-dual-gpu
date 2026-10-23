@@ -35,7 +35,7 @@ class KvCache {
 
     KvCache(int nblocks, int np_, int nblk_lane_, int snap_nb_, int lanes, KvDev * dev_)
         : np(np_), nblk_lane(nblk_lane_), snap_nb(snap_nb_), cap(nblocks / 4), dev(dev_), ref(nblocks, 0), act(nblocks, 0),
-          parked(lanes, -1), busy(lanes, 0) {
+          parked(lanes, -1), busy(lanes, 0), guard(lanes, -1) {
         free_.reserve(nblocks);
         for (int i = nblocks - 1; i >= 0; i--) free_.push_back(i); // low ids first
         nodes[0].hash = 0xcbf29ce484222325ULL;
@@ -134,6 +134,7 @@ class KvCache {
         pin = sid;
         if (parked[lane] >= 0) stash(parked[lane]);
         busy[lane] = 1;
+        guard[lane] = sid;
         if (sid >= 0 && !inplace) dev->snap_load(lane, o.pos, snaps.at(sid).blks);
         pin = -1;
         if (!blk.empty()) dev->upload_bt(lane, 0, blk.data(), (int) blk.size());
@@ -165,6 +166,7 @@ class KvCache {
         }
         trim(blk, 0);
         busy[lane] = 0;
+        guard[lane] = -1;
     }
 
     // ---------------- snapshots ----------------
@@ -175,6 +177,7 @@ class KvCache {
         const int have = find(toks, pos);
         if (have >= 0) {
             snaps.at(have).used = ++tick;
+            if (busy[lane]) guard[lane] = have;
             return false;
         }
         // the partial block holding pos is copied: the sequence keeps writing its own one
@@ -191,6 +194,7 @@ class KvCache {
         dev->snap_save(lane, pos, s.blks);
         snap_used += snap_nb;
         nodes.at(node).snaps.push_back(id);
+        if (busy[lane]) guard[lane] = id;
         return true;
     }
 
@@ -283,6 +287,10 @@ class KvCache {
     int snap_next = 0, snap_used = 0;
     std::vector<int> parked; // per lane: its parked snapshot or -1
     std::vector<char> busy;  // per lane: bound to an open sequence
+    // per busy lane: the deepest snapshot of its sequence's prompt (the one it resumed from or took last).  A long
+    // generation outlives the LRU order of the other lanes' turns; this snapshot is where its conversation's next
+    // request falls back to when the turn just generated does not match, so eviction takes it only as a last resort.
+    std::vector<int> guard;
     uint64_t tick = 0;
     int pin = -1; // snapshot an open() is about to restore: never evicted meanwhile
 
@@ -426,6 +434,8 @@ class KvCache {
         }
     }
     void remove(int sid) {
+        for (int & g : guard)
+            if (g == sid) g = -1;
         Snap & s = snaps.at(sid);
         if (s.lane >= 0) {
             parked[s.lane] = -1;
@@ -439,14 +449,24 @@ class KvCache {
         snaps.erase(sid);
         prune(node);
     }
-    // least recently used snapshot other than pin and keep (real_only: one holding blocks); -1 if none
+    // least recently used snapshot other than pin and keep (real_only: one holding blocks), a busy lane's guard
+    // only when nothing else is left; -1 if none
     int lru(bool real_only, int keep) const {
-        int v = -1;
-        uint64_t u = UINT64_MAX;
-        for (const auto & kv : snaps)
-            if (kv.first != pin && kv.first != keep && (!real_only || kv.second.lane < 0) && kv.second.used < u)
-                v = kv.first, u = kv.second.used;
-        return v;
+        auto guarded = [&](int id) {
+            for (size_t l = 0; l < guard.size(); l++)
+                if (guard[l] == id && busy[l]) return true;
+            return false;
+        };
+        for (const bool spare : {true, false}) {
+            int v = -1;
+            uint64_t u = UINT64_MAX;
+            for (const auto & kv : snaps)
+                if (kv.first != pin && kv.first != keep && (!real_only || kv.second.lane < 0) && kv.second.used < u &&
+                    !(spare && guarded(kv.first)))
+                    v = kv.first, u = kv.second.used;
+            if (v >= 0) return v;
+        }
+        return -1;
     }
     // evicts LRU snapshots (and the nodes only they kept) until k blocks are free
     bool room(int k, int keep = -1) {

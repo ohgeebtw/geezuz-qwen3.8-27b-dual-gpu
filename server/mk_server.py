@@ -6,15 +6,17 @@ llama-server's API that open-jet uses).
 
 POST /v1/chat/completions (streaming or not): the request is rendered with the chat template stored
 in the GGUF (enable_thinking / preserve_thinking / reasoning_effort via chat_template_kwargs, tools
-via `tools`), reasoning is returned as `reasoning_content`, Qwen's XML tool calls as structured
+via `tools`), reasoning is returned as `reasoning_content` (a tool call opened inside thinking, `<tool_call>` or
+`<function=`, ends it), Qwen's XML tool calls as structured
 `tool_calls`.  Sampling: temperature, top_p, top_k (<= 32), min_p, seed.  Requests reuse processed prompt
 prefixes across requests and conversations (the engine's prefix cache in the KV pool): a request starts from
 the longest cached prefix with a stored DeltaNet state (a finished request's end, the state before a prompt's
 last token, the end of a leading system message and the start of the last user message) and only the rest is
 prefilled; usage.prompt_tokens_details.cached_tokens reports the reused tokens.
 GET /health, GET /v1/models. --slots N decodes up to N requests at once; more wait for a free slot. A prompt is
-prefilled between decode cycles; while others decode it goes in chunks (--prefill-chunk), shortest remaining prompt
-first, for a share of the time (--prefill-share), so running requests keep the rest of their speed. A prompt that
+prefilled between decode cycles; while others decode it goes in chunks (--prefill-chunk), rounds alternating between
+shortest remaining prompt first and longest waiting first, for a share of the time (--prefill-share), so running
+requests keep the rest of their speed and a long prompt is not starved by a stream of short ones. A prompt that
 shares a snapshot point (e.g. the system message) with a prompt still being prefilled waits for it and starts from
 its snapshot. Every log line of a request carries its id: the client's X-Request-Id (letters, digits, ._:-, at most
 128) or else the response id; the response echoes it in an X-Request-Id header. The requests share one KV pool
@@ -25,15 +27,19 @@ prefilling its prompt plus what it generated (mostly cached), its stream continu
 alone that cannot grow ends with finish_reason "length".
 GET /status: what the engine is doing now (phase, live token count, tail of the reasoning / text / tool call being
 generated, per slot under `slots` with the request `id`), the KV pool (`kv_pool`, read after every decode cycle;
-`used_blocks` = held by running requests, `updated` = read time), preemptions (`preempted`, per slot `preempts`)
+`used_blocks` = held by running requests, `updated` = read time), preemptions (`preempted`, per slot `preempts`),
+the MTP draft counters since load (`draft`: cycles, drafted, accepted, accept_rate)
 and the stats of the last finished request.  A slot reading its prompt (phase prefill / resume) shows `prefilled`
 (sequence position reached, live per 2,048-token chunk) and `prefill_tok_s` (prompt tokens processed since
 admission, cached ones excluded, per second up to when that position was reached).
 """
 import argparse
+import array
+import bisect
 import codecs
 import collections
 import ctypes
+import hashlib
 import json
 import os
 import queue
@@ -72,16 +78,18 @@ class Engine:
     def __init__(self, lib, model, ctx, n_draft, draft_vocab, kv_mode=-1, n_seq=1, kv_mem=0):
         L = self.L = ctypes.CDLL(lib)
         vp, ip, cp = ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p
+        lp = ctypes.POINTER(ctypes.c_long)
         sig = {
             "mk_new": (vp, [cp, ctypes.c_int, ctypes.c_int, cp, ctypes.c_int, ctypes.c_int, ctypes.c_int]),
             "mk_pool_stats": (None, [vp, ip, ip, ip, ip, ip]),
+            "mk_stats": (None, [vp, lp, lp, lp]),
             "mk_seq_open": (ctypes.c_int, [vp, ip, ctypes.c_int, ip]),
             "mk_seq_close": (ctypes.c_int, [vp, ctypes.c_int, ctypes.c_int]),
             "mk_seq_blocks": (ctypes.c_int, [vp, ctypes.c_int]),
             "mk_kv_ahead": (ctypes.c_int, []),
             "mk_last_error": (cp, []),
             "mk_chat_template": (ctypes.c_int, [vp, cp, ctypes.c_int]),
-            "mk_tokenize": (ctypes.c_int, [vp, cp, ctypes.c_int, ip, ctypes.c_int]),
+            "mk_tokenize": (ctypes.c_int, [vp, cp, ctypes.c_int, ip, ctypes.c_int, ctypes.c_int]),
             "mk_piece": (ctypes.c_int, [vp, ctypes.c_int, cp, ctypes.c_int]),
             "mk_is_eog": (ctypes.c_int, [vp, ctypes.c_int]),
             "mk_set_sampling": (ctypes.c_int, [vp, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_int,
@@ -113,15 +121,15 @@ class Engine:
         self.L.mk_chat_template(self.h, buf, n)
         return buf.raw[:n].decode()
 
-    def tokenize(self, text):
+    def tokenize(self, text, special=True):
         b = text.encode()
         cap = len(b) + 16
         out = (ctypes.c_int * cap)()
-        n = self.L.mk_tokenize(self.h, b, len(b), out, cap)
+        n = self.L.mk_tokenize(self.h, b, len(b), out, cap, int(special))
         if n < 0:
             cap = -n
             out = (ctypes.c_int * cap)()
-            n = self.L.mk_tokenize(self.h, b, len(b), out, cap)
+            n = self.L.mk_tokenize(self.h, b, len(b), out, cap, int(special))
         return list(out[:n])
 
     def piece(self, tok):
@@ -194,6 +202,12 @@ class Engine:
         self.L.mk_pool_stats(self.h, *(ctypes.byref(x) for x in v))
         return dict(zip(("free_blocks", "total_blocks", "block_tokens", "cached_blocks", "evictable_blocks"),
                         (x.value for x in v)))
+
+    def draft_stats(self):
+        """decode cycles, drafts verified and drafts accepted since load (summed over the batch's sequences)"""
+        v = [ctypes.c_long() for _ in range(3)]
+        self.L.mk_stats(self.h, *(ctypes.byref(x) for x in v))
+        return dict(zip(("cycles", "drafted", "accepted"), (x.value for x in v)))
 
     def kv_ahead(self):
         return self.L.mk_kv_ahead()
@@ -268,6 +282,59 @@ def normalize_messages(messages):
     return out
 
 
+def protect_spans(messages, tools, mark, spans):
+    def wrap(s, escape=False):
+        core = s.strip()
+        if not core:
+            return s
+        lead, trail = s[:len(s) - len(s.lstrip())], s[len(s.rstrip()):]
+        spans.append(json.dumps(core, ensure_ascii=False)[1:-1] if escape else core)
+        return lead + mark + str(len(spans) - 1) + mark + trail
+
+    out = []
+    for m in messages:
+        m = dict(m)
+        c = m.get("content")
+        if isinstance(c, str):
+            m["content"] = wrap(c)
+        elif isinstance(c, list):
+            parts = []
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                    part = dict(part)
+                    part["text"] = wrap(part["text"])
+                parts.append(part)
+            m["content"] = parts
+        if isinstance(m.get("reasoning_content"), str):
+            m["reasoning_content"] = wrap(m["reasoning_content"])
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            calls = []
+            for tc in m["tool_calls"]:
+                tc = dict(tc)
+                fn = dict(tc.get("function") or {})
+                if isinstance(fn.get("arguments"), dict):
+                    fn["arguments"] = {k: wrap(v) if isinstance(v, str) else v for k, v in fn["arguments"].items()}
+                tc["function"] = fn
+                calls.append(tc)
+            m["tool_calls"] = calls
+        out.append(m)
+    new_tools = None
+    if tools:
+        new_tools = []
+        for t in tools:
+            if isinstance(t, dict):
+                t = dict(t)
+                if isinstance(t.get("function"), dict):
+                    f = dict(t["function"])
+                    if isinstance(f.get("description"), str):
+                        f["description"] = wrap(f["description"], True)
+                    t["function"] = f
+                elif isinstance(t.get("description"), str):
+                    t["description"] = wrap(t["description"], True)
+            new_tools.append(t)
+    return out, new_tools
+
+
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*<function=([^>\n]+)>(.*?)(?:</function>\s*(?:</tool_call>|$)|$)", re.S)
 PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", re.S)
 
@@ -313,12 +380,22 @@ class OutputParser:
         while True:
             if self.mode == "reasoning":
                 i = self.buf.find("</think>")
+                if self.tools:
+                    js = [x for x in (self.buf.find("<tool_call>"), self.buf.find("<function=")) if x >= 0]
+                    j = min(js) if js else -1
+                    if j >= 0 and (i < 0 or j < i):
+                        out.append(("reasoning", self.buf[:j].rstrip()))
+                        self.tool_text = self.buf[j:] if self.buf.startswith("<tool_call>", j) \
+                            else "<tool_call>\n" + self.buf[j:]
+                        self.buf = ""
+                        self.mode = "tools"
+                        break
                 if i >= 0:
                     out.append(("reasoning", self.buf[:i]))
                     self.buf = self.buf[i + len("</think>"):]
                     self.mode = "content_start"
                     continue
-                keep = 0 if final else len("</think>") - 1
+                keep = 0 if final else len("<tool_call>" if self.tools else "</think>") - 1
                 if len(self.buf) > keep:
                     out.append(("reasoning", self.buf[:len(self.buf) - keep]))
                     self.buf = self.buf[len(self.buf) - keep:]
@@ -361,6 +438,116 @@ class OutputParser:
 # ---------------------------------------------------------------------------------------------
 
 
+class TurnReplay:
+    """Generated assistant turns, put back into later prompts in place of their template rendering.
+
+    A client sends a turn back as parsed text and the chat template renders it again.  Whitespace the parser dropped
+    and markup it normalized (a tool call opened inside thinking gets a </think>) make that rendering differ from the
+    tokens the model generated, and on this hybrid model a prompt that differs from the cache once is prefilled from
+    there on: the DeltaNet state cannot be cut back.  A finished request leaves its prompt and generated turn; the next
+    prompt that starts with that prompt and renders the turn with the same text (whitespace and the markup above
+    aside) gets the generated tokens instead, and every later prompt of the conversation gets them through the stored
+    (rendered -> generated) pair.  A turn whose text differs (edited by the client) keeps its rendering."""
+
+    MARKUP = ("<think>", "</think>", "<tool_call>")
+
+    def __init__(self, im_start, im_end, text, cap=4096, recent=64):
+        self.im_start, self.im_end = im_start, im_end  # token ids
+        self.text = text  # tokens -> str
+        self.cap = cap
+        self.subs = collections.OrderedDict()  # (generation prompt, rendered turn) -> generated turn, LRU order
+        self.gps = collections.Counter()  # generation prompts of the stored pairs
+        self.pending = collections.deque(maxlen=recent)  # finished turns no later prompt has met yet
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def digest(toks):
+        return hashlib.blake2b(array.array("i", toks).tobytes(), digest_size=16).digest()
+
+    def finished(self, rid, prompt, gen):
+        """scheduler side: a request ended its turn with an end-of-generation token; gen = the turn's tokens"""
+        try:
+            i = len(prompt) - 1 - prompt[::-1].index(self.im_start)
+        except ValueError:
+            return
+        if gen[-1] != self.im_end:  # the rendering closes the turn with <|im_end|>
+            gen = gen[:-1] + [self.im_end]
+        entry = (rid, len(prompt), tuple(prompt[-16:]), self.digest(prompt), tuple(prompt[i:]), gen)
+        with self.lock:
+            self.pending.append(entry)
+
+    def apply(self, toks, rid, log=None):
+        """handler side: the prompt with every known turn replayed and the turn of a finished request it continues"""
+        with self.lock:
+            toks = self.substitute(toks)
+            for entry in reversed(self.pending):
+                prev, n, tail, h, gp, gen = entry
+                if n >= len(toks) or tuple(toks[max(0, n - 16):n]) != tail or self.digest(toks[:n]) != h:
+                    continue
+                self.pending.remove(entry)
+                try:
+                    e = toks.index(self.im_end, n)
+                except ValueError:
+                    break
+                rendered = toks[n:e + 1]
+                if rendered == gen:
+                    break
+                k = next((k for k, (a, b) in enumerate(zip(rendered, gen)) if a != b), min(len(rendered), len(gen)))
+                same = self.norm(rendered) == self.norm(gen)
+                if log:
+                    log(f"[{rid}]: turn of [{prev}] rendered as {len(rendered)} tok, generated as {len(gen)} tok, "
+                        f"first difference at token {k}: {self.text(rendered[k:k + 6])!r} vs {self.text(gen[k:k + 6])!r}"
+                        + (", generated tokens replayed" if same else ", text differs: rendering kept"))
+                if same:
+                    self.store(gp, rendered, gen)
+                    toks = toks[:n] + gen + toks[e + 1:]
+                break
+        return toks
+
+    def norm(self, toks):
+        s = re.sub(r"\s+", "", self.text(toks))
+        for m in self.MARKUP:
+            s = s.replace(m, "")
+        return s
+
+    def store(self, gp, rendered, gen):
+        key = (gp, tuple(rendered))
+        if key not in self.subs:
+            self.gps[gp] += 1
+        self.subs[key] = gen
+        self.subs.move_to_end(key)
+        while len(self.subs) > self.cap:
+            (old, _), _ = self.subs.popitem(last=False)
+            self.gps[old] -= 1
+            if not self.gps[old]:
+                del self.gps[old]
+
+    def substitute(self, toks):
+        """replaces every rendered turn of a stored pair by its generated tokens"""
+        if not self.subs:
+            return toks
+        ends = [i for i, t in enumerate(toks) if t == self.im_end]
+        out, at = [], 0
+        for i, t in enumerate(toks):
+            if t != self.im_start or i < at:
+                continue
+            for gp in self.gps:
+                if tuple(toks[i:i + len(gp)]) != gp:
+                    continue
+                start = i + len(gp)
+                j = bisect.bisect_left(ends, start)
+                if j == len(ends):
+                    break
+                key = (gp, tuple(toks[start:ends[j] + 1]))
+                gen = self.subs.get(key)
+                if gen is not None:
+                    self.subs.move_to_end(key)
+                    out += toks[at:start] + gen
+                    at = ends[j] + 1
+                break
+        return out + toks[at:] if at else toks
+
+
 class Job:
     """one chat completion; the scheduler thread runs it, the handler thread reads its events"""
 
@@ -374,6 +561,8 @@ class Job:
         self.dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.tail, self.shown = {"reasoning": "", "content": ""}, 0.0
         self.n_gen, self.n_think, self.finish, self.reused = 0, 0, "length", 0
+        self.cycles, self.cycle_toks = 0, 0  # decode cycles it took part in and the tokens they emitted
+        self.finish_tok = None
         self.events = queue.Queue()
         self.cancelled = False  # set by the handler when the client is gone
         self.slot = None  # the /status seat it runs in
@@ -420,12 +609,17 @@ class Server:
         self.queue = queue.Queue()
         self.waiting = collections.deque()  # jobs not admitted yet for lack of a slot or KV blocks, in arrival order
         self.pool = self.pool_stats()  # refreshed by the scheduler thread; handlers only read eng.prefill_progress()
+        self.draft = self.draft_stats()  # MTP draft counters since load, refreshed with the pool
         self.pf = None  # (slot, engine call count before it) while prefill() feeds that slot's prompt
         self.pf_on = threading.Event()  # set while self.pf is
         self.pf_seen = None  # (slot, engine call count, position, time the position was first seen)
         self.prefill_owed = 0.0  # decode seconds owed to running requests before the next prompt chunk
+        self.pf_round = 0  # prompt chunk rounds; odd: shortest remaining prompt first, even: longest waiting first
         self.kv_ahead = self.eng.kv_ahead()
         self.im_start = self.eng.tokenize("<|im_start|>")
+        im_end = self.eng.tokenize("<|im_end|>")
+        self.replay = TurnReplay(self.im_start[0], im_end[0], self.detok) \
+            if len(self.im_start) == 1 and len(im_end) == 1 else None
         self.think_stop_n = len(self.eng.tokenize(THINK_STOP))
         self.active = {}  # slot -> Job, touched by the scheduler thread only
         self.admissions = 0
@@ -457,6 +651,9 @@ class Server:
         for i in ids:
             self.eng.seq_close(i, keep=False)
 
+    def detok(self, toks):
+        return b"".join(self.eng.piece(t) for t in toks).decode(errors="replace")
+
     def warn_once(self, key, msg):
         if key not in self.warned:
             self.warned.add(key)
@@ -464,9 +661,12 @@ class Server:
 
     def render(self, body):
         kw = dict(body.get("chat_template_kwargs") or {})
-        ctx = dict(messages=normalize_messages(body.get("messages") or []), add_generation_prompt=True)
+        mark = next(chr(c) for c in range(0xE000, 0xF900) if chr(c) not in json.dumps(body, ensure_ascii=False))
+        spans = []
+        msgs, tools = protect_spans(normalize_messages(body.get("messages") or []), body.get("tools"), mark, spans)
+        ctx = dict(messages=msgs, add_generation_prompt=True)
         if body.get("tools"):
-            ctx["tools"] = body["tools"]
+            ctx["tools"] = tools
         for k in ("enable_thinking", "preserve_thinking", "reasoning_effort"):
             if k in kw:
                 ctx[k] = kw[k]
@@ -475,13 +675,22 @@ class Server:
         except jinja2.exceptions.TemplateError as e:
             raise BadRequest(f"chat template: {e}")
         thinking = text.endswith("<think>\n")
-        return text, thinking
+        toks = []
+        for n, part in enumerate(re.split("(" + re.escape(mark) + r"\d+" + re.escape(mark) + ")", text)):
+            if not part:
+                continue
+            if n % 2:
+                toks += self.eng.tokenize(spans[int(part.strip(mark))], special=False)
+            else:
+                toks += self.eng.tokenize(part)
+        return toks, thinking
 
     def prepare(self, body, rid=None):
         """handler side: renders and tokenizes the request (BadRequest before anything is streamed)"""
-        text, thinking = self.render(body)
-        toks = self.eng.tokenize(text)
-        max_new = int(body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1)
+        toks, thinking = self.render(body)
+        if self.replay:
+            toks = self.replay.apply(toks, rid, log)
+        max_new =int(body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1)
         budget = body.get("thinking_budget", (body.get("chat_template_kwargs") or {}).get("thinking_budget",
                                                                                          self.args.think_budget))
         budget = int(budget or 0) if thinking else 0
@@ -555,7 +764,7 @@ class Server:
         busy = [st for st in slots if st["busy"]]
         top = max(busy or slots, key=lambda st: st["updated"])
         return {**top, "busy": bool(busy), "last": self.last, "queued": self.queue.qsize() + len(self.waiting),
-                "kv_pool": self.pool, "preempted": self.preempted, "slots": slots}
+                "kv_pool": self.pool, "preempted": self.preempted, "draft": self.draft, "slots": slots}
 
     def prefill_status(self, st):
         """slot snapshot st with its live prompt progress while it reads its prompt"""
@@ -630,11 +839,14 @@ class Server:
             for job in filling:
                 self.prefill(job)
         elif filling and self.prefill_owed <= 0:
-            # one chunk's worth, shortest remaining prompts first (short prompts arriving together start together), then
-            # decode cycles until the decoders got their share back
+            # one chunk's worth, then decode cycles until the decoders got their share back.  Rounds alternate between
+            # shortest remaining prompts first (short prompts arriving together start together) and longest waiting
+            # first, so a long prompt keeps half the prefill time while other conversations keep sending short turns
+            self.pf_round += 1
+            order = (lambda j: (len(j.feed) - j.fed, j.admitted)) if self.pf_round % 2 else (lambda j: (j.t0, j.admitted))
             budget = self.args.prefill_chunk
             t = time.time()
-            for job in sorted(filling, key=lambda j: (len(j.feed) - j.fed, j.admitted)):
+            for job in sorted(filling, key=order):
                 rest = len(job.feed) - job.fed
                 if rest > budget and budget < self.args.prefill_chunk:
                     break
@@ -648,6 +860,7 @@ class Server:
         self.cycle()
         self.prefill_owed = max(0.0, self.prefill_owed - (time.time() - t))
         self.pool = self.pool_stats()
+        self.draft = self.draft_stats()
 
     def admit(self, job):
         """opens the job's sequence from the longest cached prefix; the rest of its feed is prefilled by prefill()"""
@@ -695,6 +908,11 @@ class Server:
         p = self.eng.pool_stats()
         used = p["total_blocks"] - p["free_blocks"] - p["evictable_blocks"]
         return {**p, "used_blocks": used, "updated": time.time()}
+
+    def draft_stats(self):
+        """the engine's draft counters plus the share of verified drafts accepted"""
+        d = self.eng.draft_stats()
+        return {**d, "accept_rate": d["accepted"] / d["drafted"] if d["drafted"] else 0.0}
 
     def fits(self, job):
         """optimistic admission: free blocks plus the cached ones the engine can evict cover the job's feed, one
@@ -841,7 +1059,10 @@ class Server:
         else:
             return
         for s, toks in zip(stepping, outs):
-            self.consume(self.active[s], toks)
+            job = self.active[s]
+            job.cycles += 1
+            job.cycle_toks += len(toks)
+            self.consume(job, toks)
 
     @staticmethod
     def stop_due(job):
@@ -866,6 +1087,7 @@ class Server:
                 job.n_think += 1
             if self.eng.is_eog(t):
                 job.finish, done = "stop", True
+                job.finish_tok = t
                 break
             for kind, delta in job.parser.feed(job.dec.decode(self.eng.piece(t))):
                 job.show(kind, delta)
@@ -906,9 +1128,13 @@ class Server:
         t2 = time.time()
         n_gen, n_prompt = job.n_gen, len(job.toks)
         end = "cancelled" if job.cancelled else job.finish
+        tail = ""
+        if job.finish_tok is not None:
+            tail = f" tok={job.finish_tok} {self.eng.piece(job.finish_tok).decode(errors='replace')!r}"
         log(f"slot {job.slot} [{job.rid}]: prompt {n_prompt} tok ({job.reused} reused) in {job.t1 - job.t0:.2f} s, "
             f"{n_gen} tok in {t2 - job.t1:.2f} s ({self.rate(n_gen, t2 - job.t1):.1f} tok/s), "
-            f"{end}" + (f", preempted {job.preempts}x" if job.preempts else ""))
+            f"{end}{tail}" + (f", {job.cycle_toks / job.cycles:.2f} tok/cycle" if job.cycles else "")
+            + (f", preempted {job.preempts}x" if job.preempts else ""))
         usage = {"prompt_tokens": n_prompt, "completion_tokens": n_gen, "total_tokens": n_prompt + n_gen,
                  "prompt_tokens_details": {"cached_tokens": job.reused}}
         timings = {"prompt_n": n_prompt - job.reused, "prompt_ms": (job.t1 - job.t0) * 1e3, "predicted_n": n_gen,
@@ -925,6 +1151,12 @@ class Server:
                          "reused": job.reused, "prefill_s": job.t1 - job.t0, "finish": end, "preempts": job.preempts,
                          "at": t2}
         self.track(job.slot, busy=False, phase="idle", action=action)
+        if self.replay and job.finish_tok is not None and not job.cancelled and job.seq is not None:
+            try:
+                seq = self.eng.sequence(job.seq)
+                self.replay.finished(job.rid, job.toks, seq[len(job.toks):seq.index(job.finish_tok, len(job.toks)) + 1])
+            except Exception as e:
+                log(f"slot {job.slot} [{job.rid}]: turn not kept for replay:", repr(e))
         self.release(job)
         job.events.put(("done", (job.finish, calls, usage, timings)))
 
@@ -1086,8 +1318,9 @@ def main():
     ap.add_argument("--slots", type=int, default=1,
                     help="requests decoded at once (1..8), their KV taken from the shared pool as they grow; with the "
                          "TP2 library they share one batched cycle")
-    ap.add_argument("--prefill-chunk", type=int, default=512,
-                    help="prompt tokens fed at a time while other requests decode (they stall one chunk at most)")
+    ap.add_argument("--prefill-chunk", type=int, default=2048,
+                    help="prompt tokens fed at a time while other requests decode (they stall one chunk at most; "
+                         "smaller chunks re-read the cached context more often, which slows deep prompts)")
     ap.add_argument("--prefill-share", type=float, default=0.25,
                     help="share of the time prompts are prefilled while other requests decode (0..1]: the decoders "
                          "keep the rest of their speed, a prompt takes 1/share times as long")

@@ -34,4 +34,28 @@ int main() {
     open_prompt({}); feed(seqs[2], std::vector<int>(20, 1), true, {}); check_all();
     for (int k = 0; k < 30; k++) { op_step(); check_all(); }
     printf("scenario 3 (exhaustion, ensure_all all-or-nothing): ok, free %d\n", kc->free_blocks());
+    // 4: a busy lane's deepest prompt snapshot outlives the LRU churn of the other lanes' turns
+    seqs.clear();
+    NB = 64; NP = 4; SNB = 2; LANES = 3;
+    dev = new Fake; kc = new KvCache<Meta>(NB, NP, NBL, SNB, LANES, dev); // cap 16 blocks: 8 snapshots
+    open_prompt({}); feed(seqs[0], {1, 1, 1, 1, 1, 2}, true, {}); check_all();
+    const int g = kc->guard[seqs[0].lane];
+    if (g < 0 || kc->snaps.at(g).pos != 5) FAIL("no guard on the prompt snapshot");
+    for (int k = 0; k < 40; k++) { // other turns: fresh prompts with two snapshots each, closed and parked
+        std::vector<int> p = {2, (k % 3), (k / 3) % 3, (k / 9) % 3, 0, 1, 2};
+        open_prompt({}); feed(seqs.back(), p, true, {3});
+        kc->close(seqs.back().lane, seqs.back().toks.data(), seqs.back().c, seqs.back().blk, true, Meta{seqs.back().c});
+        seqs.pop_back(); check_all();
+        if (!kc->snaps.count(g)) FAIL("guarded snapshot evicted at turn %d", k);
+    }
+    if ((int) kc->snaps.size() < 4) FAIL("churn took no snapshots");
+    { Seq & q = seqs[0]; kc->close(q.lane, q.toks.data(), q.c, q.blk, true, Meta{q.c}); seqs.clear(); check_all(); }
+    for (int k = 0; k < 40; k++) {
+        std::vector<int> p = {0, (k % 3), (k / 3) % 3, (k / 9) % 3, 2, 1, 0};
+        open_prompt({}); feed(seqs.back(), p, true, {3});
+        kc->close(seqs.back().lane, seqs.back().toks.data(), seqs.back().c, seqs.back().blk, true, Meta{seqs.back().c});
+        seqs.pop_back(); check_all();
+    }
+    if (kc->snaps.count(g)) FAIL("snapshot kept after its lane closed");
+    puts("scenario 4 (busy lane's prompt snapshot survives LRU churn, evictable once closed): ok");
 }

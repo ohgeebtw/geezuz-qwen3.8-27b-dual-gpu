@@ -40,6 +40,9 @@ class FakeEng:
     def kv_ahead(self):
         return KV_AHEAD
 
+    def draft_stats(self):
+        return dict(cycles=0, drafted=0, accepted=0)
+
     def prefill_progress(self):
         return self.calls, self.pos
 
@@ -154,7 +157,8 @@ def run(seed, nblocks, slots, njobs, ctx=2048):
                                      top_p_instruct=0.8, top_k=20, min_p=0.0)
     srv.eng = FakeEng(nblocks, ctx, rng)
     srv.warned = set(); srv.queue = queue.Queue(); srv.waiting = collections.deque()
-    srv.pool = srv.pool_stats(); srv.prefill_owed = 0.0; srv.kv_ahead = KV_AHEAD; srv.active = {}
+    srv.pool = srv.pool_stats(); srv.prefill_owed = 0.0; srv.pf_round = 0; srv.kv_ahead = KV_AHEAD; srv.active = {}
+    srv.replay = mk.TurnReplay(1000, EOG, lambda toks: " ".join(map(str, toks)))
     srv.admissions = 0; srv.preempted = 0; srv.think_stop_n = len(THINK_TOKS)
     srv.slot_status = [{"slot": s, "busy": False, "phase": "idle", "action": None, "updated": 0} for s in range(slots)]
     srv.pf, srv.pf_on, srv.pf_seen = None, threading.Event(), None

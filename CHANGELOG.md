@@ -25,6 +25,7 @@ greedy, `-d 4`. The newest build is the last row; what each one changed is under
 
 ## Unreleased
 
+- **Server keeps the prefix cache across long turns**: generated turns are replayed in later prompts when the template renders them with other tokens (dropped whitespace, a `</think>` added before a tool call opened inside thinking), which made a hybrid model prefill the whole conversation again; a running request's deepest prompt snapshot is evicted last; prompt chunks default to 2048 tokens (was 512) and alternate between shortest remaining and longest waiting prompt first, so a long prompt is no longer starved by short turns.
 - **Server sampling defaults follow the model card** (contributed by chimpera): a request without sampling values gets temperature 1.0, top_p 0.95 when thinking and 0.7, 0.8 when not, top_k 20 and min_p 0 in both (was 0.8, 0.95, 40, 0.05 for every request); `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--temperature-instruct`, `--top-p-instruct` change them.
 
 ## v0.3.2: no crash with sampling at 5+ parallel requests

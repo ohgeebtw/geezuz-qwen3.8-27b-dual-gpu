@@ -76,10 +76,10 @@ int mk_chat_template(void * hp, char * buf, int cap) {
     return n;
 }
 
-// text -> token ids (special tokens such as <|im_start|> parsed); returns the count (negative: -needed)
-int mk_tokenize(void * hp, const char * text, int len, int * out, int cap) {
+// text -> token ids (special tokens such as <|im_start|> parsed only when parse_special is set); returns the count (negative: -needed)
+int mk_tokenize(void * hp, const char * text, int len, int * out, int cap, int parse_special) {
     auto * h = static_cast<Handle *>(hp);
-    return llama_tokenize(h->vocab, text, len, out, cap, false, true);
+    return llama_tokenize(h->vocab, text, len, out, cap, false, parse_special != 0);
 }
 
 // token -> its bytes (special tokens rendered as text); returns the byte count
